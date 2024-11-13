@@ -3,29 +3,29 @@ import numpy as np
 import logging
 import pycuda.driver as drv
 
+from ObjectTracker import BYTETracker
 from taskConditions import TaskConditions, Logger
-from ObjectDetector.yoloDetector import YoloDetector
+from ObjectDetector import YoloDetector, EfficientdetDetector
 from ObjectDetector.utils import ObjectModelType,  CollisionType
 from ObjectDetector.distanceMeasure import SingleCamDistanceMeasure
 
-from TrafficLaneDetector.ultrafastLaneDetector.ultrafastLaneDetector import UltrafastLaneDetector
-from TrafficLaneDetector.ultrafastLaneDetector.ultrafastLaneDetectorV2 import UltrafastLaneDetectorV2
-from TrafficLaneDetector.ultrafastLaneDetector.perspectiveTransformation import PerspectiveTransformation
-from TrafficLaneDetector.ultrafastLaneDetector.utils import LaneModelType, OffsetType, CurvatureType
+from TrafficLaneDetector import UltrafastLaneDetector, UltrafastLaneDetectorV2
+from TrafficLaneDetector.ufldDetector.perspectiveTransformation import PerspectiveTransformation
+from TrafficLaneDetector.ufldDetector.utils import LaneModelType, OffsetType, CurvatureType
 LOGGER = Logger(None, logging.INFO, logging.INFO )
 
-video_path = "./TrafficLaneDetector/temp/demo-1.mp4"
+video_path = "./TrafficLaneDetector/temp/demo-7.mp4"
 lane_config = {
 	"model_path": "./TrafficLaneDetector/models/culane_res18_fp16.trt",
 	"model_type" : LaneModelType.UFLDV2_CULANE
 }
 
 object_config = {
-	"model_path": './ObjectDetector/models/yolov8m-coco_fp16.trt',
-	"model_type" : ObjectModelType.YOLOV8,
+	"model_path": './ObjectDetector/models/yolov10n-coco_fp16.trt',
+	"model_type" : ObjectModelType.YOLOV10,
 	"classes_path" : './ObjectDetector/models/coco_label.txt',
 	"box_score" : 0.4,
-	"box_nms_iou" : 0.45
+	"box_nms_iou" : 0.5
 }
 
 # Priority : FCWS > LDWS > LKAS
@@ -235,7 +235,7 @@ if __name__ == "__main__":
 	LOGGER.info("-"*40)
 
 	# lane detection model
-	LOGGER.info("UfldDetector Model Type : {}".format(lane_config["model_type"].name))
+	LOGGER.info("Detector Model Type : {}".format(lane_config["model_type"].name))
 	if ( "UFLDV2" in lane_config["model_type"].name) :
 		UltrafastLaneDetectorV2.set_defaults(lane_config)
 		laneDetector = UltrafastLaneDetectorV2(logger=LOGGER)
@@ -245,10 +245,15 @@ if __name__ == "__main__":
 	transformView = PerspectiveTransformation( (width, height) , logger=LOGGER)
 
 	# object detection model
-	LOGGER.info("YoloDetector Model Type : {}".format(object_config["model_type"].name))
-	YoloDetector.set_defaults(object_config)
-	objectDetector = YoloDetector(logger=LOGGER)
+	LOGGER.info("ObjectDetector Model Type : {}".format(object_config["model_type"].name))
+	if ( ObjectModelType.EfficientDet == object_config["model_type"]):
+		EfficientdetDetector.set_defaults(object_config)
+		objectDetector = EfficientdetDetector(logger=LOGGER)
+	else :
+		YoloDetector.set_defaults(object_config)
+		objectDetector = YoloDetector(logger=LOGGER)
 	distanceDetector = SingleCamDistanceMeasure()
+	objectTracker = BYTETracker(names=objectDetector.colors_dict)
 
 	# display panel
 	displayPanel = ControlPanel()
@@ -263,24 +268,30 @@ if __name__ == "__main__":
 			obect_time = time.time()
 			objectDetector.DetectFrame(frame)
 			obect_infer_time = round(time.time() - obect_time, 2)
+
+			if objectTracker :
+				box   = [obj.tolist(format_type= "xyxy") for obj in objectDetector.object_info]
+				score = [obj.conf for obj in objectDetector.object_info]
+				id    = [obj.label for  obj in objectDetector.object_info]
+				# id    = [objectDetector.class_names.index(obj.label) for  obj in objectDetector.object_info]
+				objectTracker.update(box, score, id, frame)
+
 			lane_time = time.time()
 			laneDetector.DetectFrame(frame)
 			lane_infer_time = round(time.time() - lane_time, 4)
 
 			#========================= Analyze Status ========================
-			distanceDetector.calcDistance(objectDetector.object_info)
-			vehicle_distance = distanceDetector.calcCollisionPoint(laneDetector.draw_area_points)
+			distanceDetector.updateDistance(objectDetector.object_info)
+			vehicle_distance = distanceDetector.calcCollisionPoint(laneDetector.lane_info.area_points)
 
-			analyzeMsg.UpdateCollisionStatus(vehicle_distance, laneDetector.draw_area)
-
-
-			if (analyzeMsg.CheckStatus() and laneDetector.draw_area ) :
-				transformView.updateTransformParams(laneDetector.lanes_points[1], laneDetector.lanes_points[2], analyzeMsg.transform_status)
+			if (analyzeMsg.CheckStatus() and laneDetector.lane_info.area_status ) :
+				transformView.updateTransformParams(*laneDetector.lane_info.lanes_points[1:3], analyzeMsg.transform_status)
 			birdview_show = transformView.transformToBirdView(frame_show)
 
-			birdview_lanes_points = [transformView.transformToBirdViewPoints(lanes_point) for lanes_point in laneDetector.lanes_points]
-			(vehicle_direction, vehicle_curvature) , vehicle_offset = transformView.calcCurveAndOffset(birdview_show, birdview_lanes_points[1], birdview_lanes_points[2])
+			birdview_lanes_points = [transformView.transformToBirdViewPoints(lanes_point) for lanes_point in laneDetector.lane_info.lanes_points]
+			(vehicle_direction, vehicle_curvature) , vehicle_offset = transformView.calcCurveAndOffset(birdview_show, *birdview_lanes_points[1:3])
 
+			analyzeMsg.UpdateCollisionStatus(vehicle_distance, laneDetector.lane_info.area_status)
 			analyzeMsg.UpdateOffsetStatus(vehicle_offset)
 			analyzeMsg.UpdateRouteStatus(vehicle_direction, vehicle_curvature)
 
@@ -290,6 +301,7 @@ if __name__ == "__main__":
 			laneDetector.DrawDetectedOnFrame(frame_show, analyzeMsg.offset_msg)
 			laneDetector.DrawAreaOnFrame(frame_show, displayPanel.CollisionDict[analyzeMsg.collision_msg])
 			objectDetector.DrawDetectedOnFrame(frame_show)
+			objectTracker.DrawTrackedOnFrame(frame_show, False)
 			distanceDetector.DrawDetectedOnFrame(frame_show)
 
 			displayPanel.DisplayBirdViewPanel(frame_show, birdview_show)
